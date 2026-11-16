@@ -1,128 +1,20 @@
-name: One-time verified source import
+name: One-time source import runner check
 on:
   push:
     branches: [main]
     paths: ['.github/workflows/initial-source-import.yml']
   workflow_dispatch:
 permissions:
-  contents: write
-concurrency:
-  group: mmoney-initial-source-import
-  cancel-in-progress: false
+  contents: read
 jobs:
-  import:
-    if: github.repository == 'ikanisa/M-Money'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+  runner-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
     steps:
-      - name: Create ephemeral source-transfer key
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
-        with:
-          script: |
-            const fs = require('node:fs');
-            const path = require('node:path');
-            const crypto = require('node:crypto');
-            try {
-              await github.rest.repos.getContent({...context.repo, path: 'docs/repository-import.md', ref: 'main'});
-              throw new Error('Source is already imported; this one-time job must not run again.');
-            } catch (e) { if (e.status !== 404) throw e; }
-            const {publicKey, privateKey} = crypto.generateKeyPairSync('rsa', {
-              modulusLength: 3072,
-              publicKeyEncoding: {type: 'spki', format: 'pem'},
-              privateKeyEncoding: {type: 'pkcs8', format: 'pem'}
-            });
-            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'mmoney-import-private.pem'), privateKey, {mode: 0o600});
-            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'mmoney-import-public.json'), JSON.stringify({
-              repository: 'ikanisa/M-Money', run_id: String(context.runId),
-              archive_sha256: 'b551a521630375278e951adbadde6d9a19df740c9a5bba41c69bcff8eab7ea3f',
-              archive_bytes: 13570237, files: 3143, public_key: publicKey
-            }, null, 2));
-      - name: Publish only the ephemeral public key
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: mmoney-import-public-key-${{ github.run_id }}
-          path: ${{ runner.temp }}/mmoney-import-public.json
-          retention-days: 1
-          if-no-files-found: error
-      - name: Verify and import the existing project snapshot
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
-        env:
-          IMPORT_GITHUB_TOKEN: ${{ github.token }}
-        with:
-          script: |
-            const fs = require('node:fs');
-            const path = require('node:path');
-            const crypto = require('node:crypto');
-            const {execFileSync} = require('node:child_process');
-            const expectedHash = 'b551a521630375278e951adbadde6d9a19df740c9a5bba41c69bcff8eab7ea3f';
-            const expectedBytes = 13570237;
-            const requestPath = '.github/source-import-request.json';
-            let envelope;
-            const deadline = Date.now() + 15 * 60 * 1000;
-            while (Date.now() < deadline) {
-              try {
-                const result = await github.rest.repos.getContent({...context.repo, path: requestPath, ref: 'main'});
-                if (result.data.type !== 'file' || result.data.size > 16384) throw new Error('Invalid source-transfer envelope.');
-                const candidate = JSON.parse(Buffer.from(result.data.content, 'base64').toString('utf8'));
-                if (String(candidate.run_id) === String(context.runId)) { envelope = candidate; break; }
-              } catch (e) { if (e.status !== 404) throw e; }
-              await new Promise(resolve => setTimeout(resolve, 5000));
-            }
-            if (!envelope) throw new Error('No encrypted source-transfer request arrived within this run.');
-            const privatePath = path.join(process.env.RUNNER_TEMP, 'mmoney-import-private.pem');
-            const secret = crypto.privateDecrypt({key: fs.readFileSync(privatePath), oaepHash: 'sha256', padding: crypto.constants.RSA_PKCS1_OAEP_PADDING}, Buffer.from(envelope.wrapped_key, 'base64'));
-            if (secret.length !== 32) throw new Error('Invalid transfer key.');
-            const decipher = crypto.createDecipheriv('aes-256-gcm', secret, Buffer.from(envelope.iv, 'base64'));
-            decipher.setAAD(Buffer.from(String(context.runId), 'utf8'));
-            decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
-            const transfer = JSON.parse(Buffer.concat([decipher.update(Buffer.from(envelope.ciphertext, 'base64')), decipher.final()]).toString('utf8'));
-            fs.unlinkSync(privatePath);
-            secret.fill(0);
-            if (transfer.sha256 !== expectedHash || transfer.bytes !== expectedBytes) throw new Error('Transfer does not match the approved source digest.');
-            const url = new URL(transfer.download_url);
-            if (url.protocol !== 'https:' || !url.hostname.endsWith('.oaiusercontent.com') || url.username || url.password || url.port) throw new Error('Unexpected source-transfer origin.');
-            core.setSecret(transfer.download_url);
-            const response = await fetch(transfer.download_url, {redirect: 'error', signal: AbortSignal.timeout(120000)});
-            if (!response.ok || !response.body) throw new Error('Source download failed: HTTP ' + response.status);
-            const archivePath = path.join(process.env.RUNNER_TEMP, 'mmoney-source.zip');
-            const fd = fs.openSync(archivePath, 'wx', 0o600);
-            const hash = crypto.createHash('sha256');
-            let received = 0;
-            try {
-              for await (const chunk of response.body) {
-                received += chunk.length;
-                if (received > expectedBytes) throw new Error('Source exceeds expected byte count.');
-                hash.update(chunk);
-                fs.writeSync(fd, chunk);
-              }
-            } finally { fs.closeSync(fd); }
-            if (received !== expectedBytes || hash.digest('hex') !== expectedHash) throw new Error('Source archive integrity mismatch.');
-            const candidateDir = path.join(process.env.RUNNER_TEMP, 'mmoney-candidate');
-            const cleanEnv = {...process.env, PYTHONDONTWRITEBYTECODE: '1'};
-            delete cleanEnv.IMPORT_GITHUB_TOKEN;
-            const run = (exe, args, cwd, env = cleanEnv) => execFileSync(exe, args, {cwd, env, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 120000});
-            const extract = `import pathlib,stat,sys,zipfile\narchive,output=sys.argv[1:]\nroot=pathlib.Path(output);root.mkdir()\nwith zipfile.ZipFile(archive) as z:\n entries=z.infolist()\n assert len(entries)==3143 and len({e.filename for e in entries})==3143\n assert sum(e.file_size for e in entries)<100_000_000\n for e in entries:\n  p=pathlib.PurePosixPath(e.filename)\n  assert not p.is_absolute() and '..' not in p.parts and '.git' not in p.parts and '\\\\' not in e.filename\n  assert not stat.S_ISLNK(e.external_attr>>16) and not e.is_dir()\n  target=root/p;target.parent.mkdir(parents=True,exist_ok=True)\n  target.write_bytes(z.read(e));target.chmod(0o755 if e.filename=='gradlew' else 0o644)\n`;
-            run('python3', ['-B', '-c', extract, archivePath, candidateDir], process.env.RUNNER_TEMP);
-            for (const script of ['verify_source.py', 'verify_integration.py', 'test_integration.py', 'test_transport_wiring.py', 'test_b03_sql_runtime.py']) {
-              core.info(script + ': ' + run('python3', ['-B', 'scripts/' + script], candidateDir).trim());
-            }
-            const publishDir = path.join(process.env.RUNNER_TEMP, 'mmoney-publish');
-            run('git', ['clone', '--depth', '1', '--branch', 'main', 'https://github.com/ikanisa/M-Money.git', publishDir], process.env.RUNNER_TEMP);
-            run('git', ['config', 'core.autocrlf', 'false'], publishDir);
-            run('git', ['config', 'user.name', 'github-actions[bot]'], publishDir);
-            run('git', ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], publishDir);
-            fs.cpSync(candidateDir, publishDir, {recursive: true, force: true});
-            fs.rmSync(path.join(publishDir, requestPath), {force: true});
-            fs.chmodSync(path.join(publishDir, 'gradlew'), 0o755);
-            // The connector installs the two existing CI workflows after this data-only push.
-            // GITHUB_TOKEN never creates, modifies or removes a workflow file here.
-            run('git', ['add', '--all', '--force', '--', '.', ':!.github/workflows'], publishDir);
-            const changed = run('git', ['diff', '--cached', '--name-only'], publishDir).trim().split('\n');
-            if (changed.some(p => p.startsWith('.github/workflows/'))) throw new Error('Unexpected workflow change in data import.');
-            run('git', ['commit', '-m', 'feat: import verified M-Money X-Integration.7 source'], publishDir);
-            const commit = run('git', ['rev-parse', 'HEAD'], publishDir).trim();
-            const pushEnv = {...cleanEnv, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_0: 'AUTHORIZATION: basic ' + Buffer.from('x-access-token:' + process.env.IMPORT_GITHUB_TOKEN).toString('base64')};
-            core.setSecret(pushEnv.GIT_CONFIG_VALUE_0);
-            run('git', ['push', 'origin', 'HEAD:refs/heads/main'], publishDir, pushEnv);
-            core.notice('Verified source import pushed to main: ' + commit);
-            await core.summary.addHeading('Verified M-Money source import').addRaw('Source SHA-256: ' + expectedHash + '\n\nCommit: ' + commit + '\n\n3,143 verified archive files. Two existing workflow files are installed separately by the GitHub connector. No production or device acceptance is implied.').write();
+      - name: Confirm hosted runner availability without third-party actions
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'M-Money source import runner is available.\n'
+          git --version
+          python3 --version
